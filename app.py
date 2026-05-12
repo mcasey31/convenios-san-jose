@@ -447,6 +447,12 @@ def main() -> None:
     modulo_sel = st.selectbox("Seleccionar modulo", options=modulos_visibles, index=0)
     mp_out, mr_out = get_modulo_drilldown(excel_path, modulos_reglas, modulo_sel)
 
+    if mr_out.empty:
+        st.markdown("Prestaciones dentro del modulo")
+        st.dataframe(mp_out, width="stretch", height=320)
+        st.info("No hay reglas moduladas asociadas para el catalogo/modulo seleccionado.")
+        return
+
     d1, d2 = st.columns(2)
     with d1:
         st.markdown("Prestaciones dentro del modulo")
