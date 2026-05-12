@@ -77,8 +77,9 @@ def load_data(file_path: Path) -> dict[str, pd.DataFrame]:
     homologaciones = compact_openpyxl_sheet(file_path, "Homologación")
     prestaciones_catalogos = compact_openpyxl_sheet(file_path, "PrestacionesCatalogos")
     catalogos_convenio = compact_openpyxl_sheet(file_path, "CatalogosConvenio")
-    modulo_prestacion = compact_openpyxl_sheet(file_path, "ModuloPrestacion")
     modulos_reglas = compact_openpyxl_sheet(file_path, "ModulosReglas")
+    reglas_moduladas_detalle = compact_openpyxl_sheet(file_path, "ReglasModuladasDetalle")
+    clasif_prest_val_ref = compact_openpyxl_sheet(file_path, "ClasifPrestValoresReferencia")
 
     return {
         "convenios": convenios,
@@ -86,8 +87,9 @@ def load_data(file_path: Path) -> dict[str, pd.DataFrame]:
         "homologaciones": homologaciones,
         "prestaciones_catalogos": prestaciones_catalogos,
         "catalogos_convenio": catalogos_convenio,
-        "modulo_prestacion": modulo_prestacion,
         "modulos_reglas": modulos_reglas,
+        "reglas_moduladas_detalle": reglas_moduladas_detalle,
+        "clasif_prest_val_ref": clasif_prest_val_ref,
     }
 
 
@@ -164,20 +166,60 @@ def get_catalogos_for_convenio(catalogos_convenio: pd.DataFrame, convenio_name: 
     return cats
 
 
-def get_modulo_drilldown(modulo_prestacion: pd.DataFrame, modulos_reglas: pd.DataFrame, modulo_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    mp = modulo_prestacion.copy()
-    mr = modulos_reglas.copy()
+@st.cache_data(show_spinner=False)
+def get_modulo_prestaciones_for_modulo(file_path: Path, modulo_name: str, empty_streak_limit: int = 5000) -> pd.DataFrame:
+    wb = load_workbook(file_path, data_only=True, read_only=True)
+    ws = wb["ModuloPrestacion"]
 
+    rows: list[list[str]] = []
+    empty_streak = 0
+    headers: list[str] = []
+    idx: dict[str, int] = {}
+
+    for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        vals = [norm(v) for v in row]
+        if row_idx == 1:
+            headers = vals
+            idx = {h: i for i, h in enumerate(headers) if h}
+            continue
+
+        if not any(vals):
+            empty_streak += 1
+            if rows and empty_streak >= empty_streak_limit:
+                break
+            continue
+
+        empty_streak = 0
+        modulo_i = idx.get("Modulo", 0)
+        modulo_val = vals[modulo_i] if modulo_i < len(vals) else ""
+        if modulo_val.upper() != norm(modulo_name).upper():
+            continue
+
+        rows.append(vals)
+
+    wb.close()
+
+    if not rows:
+        return pd.DataFrame(columns=["Modulo", "CodigoPrestacionReferencia", "PrestacionReferencia", "TipoInclusion", "Tope", "ESTADO"])
+
+    out = pd.DataFrame(rows, columns=headers)
     for col in ["Modulo", "CodigoPrestacionReferencia", "PrestacionReferencia", "TipoInclusion", "Tope", "ESTADO"]:
-        if col not in mp.columns:
-            mp[col] = ""
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].map(norm)
+
+    return out[["Modulo", "CodigoPrestacionReferencia", "PrestacionReferencia", "TipoInclusion", "Tope", "ESTADO"]]
+
+
+def get_modulo_drilldown(file_path: Path, modulos_reglas: pd.DataFrame, modulo_name: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    mp = get_modulo_prestaciones_for_modulo(file_path, modulo_name).copy()
+    mr = modulos_reglas.copy()
 
     for col in ["ReglaModulada", "TipoInclusion", "Orden", "Estado"]:
         if col not in mr.columns:
             mr[col] = ""
 
-    mp_mask = mp["Modulo"].map(norm).str.upper() == modulo_name.upper()
-    mp_out = mp.loc[mp_mask, ["Modulo", "CodigoPrestacionReferencia", "PrestacionReferencia", "TipoInclusion", "Tope", "ESTADO"]]
+    mp_out = mp
 
     modulo_col_mr = "Modulo" if "Modulo" in mr.columns else mr.columns[0]
     mr_mask = mr[modulo_col_mr].map(norm).str.upper() == modulo_name.upper()
@@ -185,6 +227,53 @@ def get_modulo_drilldown(modulo_prestacion: pd.DataFrame, modulos_reglas: pd.Dat
     mr_out.rename(columns={modulo_col_mr: "Modulo"}, inplace=True)
 
     return mp_out.reset_index(drop=True), mr_out.reset_index(drop=True)
+
+
+def get_regla_prestaciones_drilldown(
+    regla_name: str,
+    reglas_moduladas_detalle: pd.DataFrame,
+    clasif_prest_val_ref: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rmd = reglas_moduladas_detalle.copy()
+    cpr = clasif_prest_val_ref.copy()
+
+    for col in ["ReglaModulada", "Ambito", "ClasificacionValor", "ESTADO"]:
+        if col not in rmd.columns:
+            rmd[col] = ""
+        rmd[col] = rmd[col].map(norm)
+
+    for col in [
+        "Nomenclador",
+        "CodigoPrestacionNomencladorReferencia",
+        "PrestacionNomencladorReferencia",
+        "Clasificacion",
+        "ClasificacionValor",
+        "ESTADO",
+    ]:
+        if col not in cpr.columns:
+            cpr[col] = ""
+        cpr[col] = cpr[col].map(norm)
+
+    rmd_view = rmd.loc[rmd["ReglaModulada"].str.upper() == norm(regla_name).upper(), ["ReglaModulada", "Ambito", "ClasificacionValor", "ESTADO"]].drop_duplicates()
+
+    clasif_values = sorted([v for v in rmd_view["ClasificacionValor"].map(norm).unique().tolist() if v])
+    # Fallback: algunas reglas pueden mapear directamente por el nombre de la regla.
+    if not clasif_values and norm(regla_name):
+        clasif_values = [norm(regla_name)]
+
+    prest_view = cpr.loc[
+        cpr["ClasificacionValor"].map(norm).str.upper().isin([v.upper() for v in clasif_values]),
+        [
+            "Nomenclador",
+            "CodigoPrestacionNomencladorReferencia",
+            "PrestacionNomencladorReferencia",
+            "Clasificacion",
+            "ClasificacionValor",
+            "ESTADO",
+        ],
+    ].drop_duplicates()
+
+    return rmd_view.reset_index(drop=True), prest_view.reset_index(drop=True)
 
 
 def main() -> None:
@@ -201,57 +290,64 @@ def main() -> None:
     with st.spinner("Cargando y normalizando hojas del template..."):
         data = load_data(excel_path)
 
-    convenios = data["convenios"]
     convenios_planes = data["convenios_planes"]
     homologaciones = data["homologaciones"]
     prestaciones_catalogos = data["prestaciones_catalogos"]
     catalogos_convenio = data["catalogos_convenio"]
-    modulo_prestacion = data["modulo_prestacion"]
     modulos_reglas = data["modulos_reglas"]
+    reglas_moduladas_detalle = data["reglas_moduladas_detalle"]
+    clasif_prest_val_ref = data["clasif_prest_val_ref"]
 
-    if convenios.empty:
-        st.error("No se pudieron leer datos de la hoja Convenios.")
+    if catalogos_convenio.empty and prestaciones_catalogos.empty:
+        st.error("No se pudieron leer datos de CatalogosConvenio/PrestacionesCatalogos.")
         return
 
-    # Normalization for filters
-    if "tipo convenio" not in convenios.columns:
-        convenios["tipo convenio"] = ""
-    if "nombre" not in convenios.columns:
-        convenios["nombre"] = ""
-
-    convenios["tipo convenio"] = convenios["tipo convenio"].map(norm)
-    convenios["nombre"] = convenios["nombre"].map(norm)
-
-    st.subheader("Filtros superiores")
-    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.4, 1.0])
-
-    tipos = sorted([t for t in convenios["tipo convenio"].unique().tolist() if t])
-    tipo_sel = c1.selectbox("Tipo de convenio", options=tipos, index=0 if tipos else None)
-
-    conv_options = sorted(
-        convenios.loc[convenios["tipo convenio"] == tipo_sel, "nombre"].dropna().map(norm).unique().tolist()
-    )
-    convenio_sel = c2.selectbox("Convenio", options=conv_options, index=0 if conv_options else None)
-
+    cc = catalogos_convenio.copy()
     cp = convenios_planes.copy()
+    pc = prestaciones_catalogos.copy()
+
+    for col in ["Catalogo", "Convenio", "ESTADO"]:
+        if col not in cc.columns:
+            cc[col] = ""
+        cc[col] = cc[col].map(norm)
+
     for col in ["Convenio", "Financiador", "Plan", "Estado"]:
         if col not in cp.columns:
             cp[col] = ""
         cp[col] = cp[col].map(norm)
 
-    cp_conv = cp.loc[cp["Convenio"].str.upper() == norm(convenio_sel).upper()].copy()
+    for col in ["Catalogo", "Codigo", "Nombre", "Es Modulo", "Modulo", "Modulo Orden", "ESTADO"]:
+        if col not in pc.columns:
+            pc[col] = ""
+        pc[col] = pc[col].map(norm)
 
-    fin_options = sorted([v for v in cp_conv["Financiador"].unique().tolist() if v])
-    fin_sel = c3.selectbox("Financiador asociado", options=fin_options, index=0 if fin_options else None)
+    st.subheader("Filtros superiores")
+    c1, c2, c3, c4, c5 = st.columns([1.2, 1.2, 1.2, 1.4, 1.0])
 
-    plan_options = sorted(
-        [
-            v
-            for v in cp_conv.loc[cp_conv["Financiador"].str.upper() == norm(fin_sel).upper(), "Plan"].unique().tolist()
-            if v
-        ]
+    catalogo_options = sorted({v for v in cc["Catalogo"].tolist() if v} | {v for v in pc["Catalogo"].tolist() if v})
+    catalogo_sel = c1.selectbox("Catalogo", options=catalogo_options, index=0 if catalogo_options else None)
+
+    convenios_catalogo = sorted(
+        cc.loc[cc["Catalogo"].str.upper() == norm(catalogo_sel).upper(), "Convenio"].dropna().map(norm).unique().tolist()
     )
-    plan_sel = c4.selectbox("Plan", options=plan_options, index=0 if plan_options else None)
+    convenio_options = ["(Todos)"] + [v for v in convenios_catalogo if v]
+    convenio_sel = c2.selectbox("Convenio", options=convenio_options, index=0)
+
+    cp_conv = cp.loc[cp["Convenio"].isin(convenios_catalogo)].copy()
+    if convenio_sel != "(Todos)":
+        cp_conv = cp_conv.loc[cp_conv["Convenio"].str.upper() == norm(convenio_sel).upper()]
+
+    fin_options = ["(Todos)"] + sorted([v for v in cp_conv["Financiador"].unique().tolist() if v])
+    fin_sel = c3.selectbox("Financiador asociado", options=fin_options, index=0)
+    cp_fin = cp_conv.copy()
+    if fin_sel != "(Todos)":
+        cp_fin = cp_fin.loc[cp_fin["Financiador"].str.upper() == norm(fin_sel).upper()]
+
+    plan_options = ["(Todos)"] + sorted([v for v in cp_fin["Plan"].unique().tolist() if v])
+    plan_sel = c4.selectbox("Plan", options=plan_options, index=0)
+    cp_view = cp_fin.copy()
+    if plan_sel != "(Todos)":
+        cp_view = cp_view.loc[cp_view["Plan"].str.upper() == norm(plan_sel).upper()]
 
     only_modulo = c5.checkbox("Solo modulos", value=False)
 
@@ -260,21 +356,22 @@ def main() -> None:
     # Context cards
     cards = st.columns(4)
     cards[0].metric("Centro", BASELINE_CENTER)
-    cards[1].metric("Tipo convenio", norm(tipo_sel) or "-")
-    cards[2].metric("Convenio", norm(convenio_sel) or "-")
-    cards[3].metric("Financiador / Plan", f"{norm(fin_sel) or '-'} / {norm(plan_sel) or '-'}")
+    cards[1].metric("Catalogo", norm(catalogo_sel) or "-")
+    cards[2].metric("Convenio", norm(convenio_sel) or "(Todos)")
+    cards[3].metric("Financiador / Plan", f"{norm(fin_sel) or '(Todos)'} / {norm(plan_sel) or '(Todos)'}")
 
-    # Catalogs to filter homologaciones
-    catalogos = get_catalogos_for_convenio(catalogos_convenio, norm(convenio_sel))
-    if not catalogos:
-        # fallback: if no mapping exists, assume convenio name as catalog name
-        if norm(convenio_sel):
-            catalogos = [norm(convenio_sel)]
+    st.markdown("Asociaciones Convenio / Financiador / Plan para el catalogo seleccionado")
+    st.dataframe(
+        cp_view[["Convenio", "Financiador", "Plan", "Estado"]].drop_duplicates().reset_index(drop=True),
+        width="stretch",
+        height=180,
+    )
 
     hbase = merge_homologaciones_with_modulo(homologaciones, prestaciones_catalogos)
     hbase["Catalogo"] = hbase["Catalogo"].map(norm)
 
-    hview = hbase.loc[hbase["Catalogo"].isin(catalogos)].copy()
+    hview = hbase.loc[hbase["Catalogo"].str.upper() == norm(catalogo_sel).upper()].copy()
+    pview = pc.loc[pc["Catalogo"].str.upper() == norm(catalogo_sel).upper()].copy()
 
     # Extra filters on top for readability
     f1, f2, f3 = st.columns([1.0, 1.0, 2.2])
@@ -291,6 +388,7 @@ def main() -> None:
         hview = hview.loc[hview["Tipo Homologacion"].map(norm).isin(tipo_h_sel)]
     if only_modulo:
         hview = hview.loc[hview["Es Modulo"].map(norm).str.upper() == "SI"]
+        pview = pview.loc[pview["Es Modulo"].map(norm).str.upper() == "SI"]
 
     search_txt_norm = norm(search_txt).upper()
     if search_txt_norm:
@@ -302,12 +400,18 @@ def main() -> None:
             | hview["Modulo"].map(norm).str.upper().str.contains(search_txt_norm, na=False)
         )
         hview = hview.loc[mask]
+        pmask = (
+            pview["Codigo"].map(norm).str.upper().str.contains(search_txt_norm, na=False)
+            | pview["Nombre"].map(norm).str.upper().str.contains(search_txt_norm, na=False)
+            | pview["Modulo"].map(norm).str.upper().str.contains(search_txt_norm, na=False)
+        )
+        pview = pview.loc[pmask]
 
     st.subheader("Homologaciones configuradas (baseline San Jose)")
     k1, k2, k3 = st.columns(3)
     k1.metric("Homologaciones visibles", len(hview))
-    k2.metric("Catalogos vinculados", len(catalogos))
-    k3.metric("Filas modulo (SI)", int((hview["Es Modulo"].map(norm).str.upper() == "SI").sum()))
+    k2.metric("Prestaciones catalogo", len(pview))
+    k3.metric("Filas modulo (SI)", int((pview["Es Modulo"].map(norm).str.upper() == "SI").sum()))
 
     cols_show = [
         "Catalogo",
@@ -321,13 +425,17 @@ def main() -> None:
         "Estado",
         "Vigencia Inicio",
     ]
-    st.dataframe(hview[cols_show], use_container_width=True, height=420)
+    st.dataframe(hview[cols_show], width="stretch", height=420)
+
+    st.subheader("Prestaciones del catalogo")
+    pcols_show = ["Catalogo", "Codigo", "Nombre", "Es Modulo", "Modulo", "Modulo Orden", "ESTADO"]
+    st.dataframe(pview[pcols_show], width="stretch", height=360)
 
     st.subheader("Drilldown de modulos")
     modulos_visibles = sorted(
         [
             m
-            for m in hview.loc[hview["Es Modulo"].map(norm).str.upper() == "SI", "Modulo"].map(norm).unique().tolist()
+            for m in pview.loc[pview["Es Modulo"].map(norm).str.upper() == "SI", "Modulo"].map(norm).unique().tolist()
             if m
         ]
     )
@@ -337,15 +445,45 @@ def main() -> None:
         return
 
     modulo_sel = st.selectbox("Seleccionar modulo", options=modulos_visibles, index=0)
-    mp_out, mr_out = get_modulo_drilldown(modulo_prestacion, modulos_reglas, modulo_sel)
+    mp_out, mr_out = get_modulo_drilldown(excel_path, modulos_reglas, modulo_sel)
 
     d1, d2 = st.columns(2)
     with d1:
         st.markdown("Prestaciones dentro del modulo")
-        st.dataframe(mp_out, use_container_width=True, height=320)
+        st.dataframe(mp_out, width="stretch", height=320)
     with d2:
         st.markdown("Reglas moduladas del modulo")
-        st.dataframe(mr_out, use_container_width=True, height=320)
+        st.dataframe(mr_out, width="stretch", height=320)
+
+    st.subheader("Drilldown de regla modulada -> prestaciones asociadas")
+    reglas_modulo = sorted([v for v in mr_out["ReglaModulada"].map(norm).unique().tolist() if v])
+    reglas_globales = []
+    if not reglas_moduladas_detalle.empty and "ReglaModulada" in reglas_moduladas_detalle.columns:
+        reglas_globales = sorted([v for v in reglas_moduladas_detalle["ReglaModulada"].map(norm).unique().tolist() if v])
+
+    mostrar_todas = st.checkbox("Mostrar todas las reglas moduladas", value=False)
+    reglas_options = reglas_globales if mostrar_todas else reglas_modulo
+    if not reglas_options:
+        reglas_options = reglas_globales
+
+    if not reglas_options:
+        st.info("No se encontraron reglas moduladas para mostrar.")
+        return
+
+    regla_sel = st.selectbox("Regla modulada", options=reglas_options, index=0)
+    rmd_view, prest_regla = get_regla_prestaciones_drilldown(
+        regla_sel,
+        reglas_moduladas_detalle,
+        clasif_prest_val_ref,
+    )
+
+    rd1, rd2 = st.columns(2)
+    with rd1:
+        st.markdown("Detalle de asociacion de la regla")
+        st.dataframe(rmd_view, width="stretch", height=280)
+    with rd2:
+        st.markdown("Prestaciones asociadas a la regla")
+        st.dataframe(prest_regla, width="stretch", height=280)
 
 
 if __name__ == "__main__":
