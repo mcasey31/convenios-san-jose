@@ -373,6 +373,15 @@ def main() -> None:
     hview = hbase.loc[hbase["Catalogo"].str.upper() == norm(catalogo_sel).upper()].copy()
     pview = pc.loc[pc["Catalogo"].str.upper() == norm(catalogo_sel).upper()].copy()
 
+    # Brecha: prestaciones del catalogo sin asociacion de homologacion (codigo catalogo -> codigo referencia)
+    h_catalog = hbase.loc[hbase["Catalogo"].str.upper() == norm(catalogo_sel).upper()].copy()
+    codigos_homologados = {
+        norm(v)
+        for v in h_catalog["Codigo Catalogo"].tolist()
+        if norm(v)
+    }
+    p_no_homo = pview.loc[~pview["Codigo"].map(norm).isin(codigos_homologados)].copy()
+
     # Extra filters on top for readability
     f1, f2, f3 = st.columns([1.0, 1.0, 2.2])
     estado_opts = sorted([v for v in hview["Estado"].map(norm).unique().tolist() if v])
@@ -430,6 +439,13 @@ def main() -> None:
     st.subheader("Prestaciones del catalogo")
     pcols_show = ["Catalogo", "Codigo", "Nombre", "Es Modulo", "Modulo", "Modulo Orden", "ESTADO"]
     st.dataframe(pview[pcols_show], width="stretch", height=360)
+
+    st.subheader("Prestaciones del catalogo sin homologacion")
+    st.caption("Codigos de catalogo que no tienen asociacion a ningun codigo de referencia en la hoja Homologación.")
+    g1, g2 = st.columns(2)
+    g1.metric("Prestaciones sin homologacion", len(p_no_homo))
+    g2.metric("Prestaciones homologadas", max(len(pview) - len(p_no_homo), 0))
+    st.dataframe(p_no_homo[pcols_show], width="stretch", height=260)
 
     st.subheader("Drilldown de modulos")
     modulos_visibles = sorted(
