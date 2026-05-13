@@ -276,6 +276,53 @@ def get_regla_prestaciones_drilldown(
     return rmd_view.reset_index(drop=True), prest_view.reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False)
+def load_osde_csv() -> pd.DataFrame:
+    """Carga el CSV de OSDE desde docs/CONVENIO_BASE_OSDE/"""
+    osde_folder = _HERE / "docs" / "CONVENIO_BASE_OSDE"
+    csv_files = list(osde_folder.glob("*.csv"))
+    
+    if not csv_files:
+        return pd.DataFrame()
+    
+    # Tomar el primer CSV (en caso de haber múltiples)
+    csv_path = csv_files[0]
+    
+    try:
+        df = pd.read_csv(csv_path, sep=";", encoding="utf-8-sig")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def compare_osde_vs_template(osde_df: pd.DataFrame, template_codigos: set[str]) -> dict[str, Any]:
+    """Compara IDs del CSV OSDE vs códigos del Template"""
+    if osde_df.empty:
+        return {"error": "No se pudo cargar el archivo OSDE"}
+    
+    # Extraer códigos de OSDE (columna B = índice 1, o la segunda columna)
+    osde_codigos = set()
+    if len(osde_df.columns) > 1:
+        col_b = osde_df.columns[1]  # Segunda columna (índice 1)
+        osde_codigos = {norm(str(v)) for v in osde_df[col_b].unique() if norm(str(v))}
+    
+    template_codigos_norm = {norm(c) for c in template_codigos if c}
+    
+    # Comparativa
+    coincidencias = osde_codigos & template_codigos_norm
+    solo_osde = osde_codigos - template_codigos_norm
+    solo_template = template_codigos_norm - osde_codigos
+    
+    return {
+        "osde_codigos": osde_codigos,
+        "template_codigos": template_codigos_norm,
+        "coincidencias": coincidencias,
+        "solo_osde": solo_osde,
+        "solo_template": solo_template,
+        "osde_df": osde_df,
+    }
+
+
 def main() -> None:
     st.set_page_config(page_title="Baseline Convenios - San Jose", layout="wide")
 
@@ -289,7 +336,22 @@ def main() -> None:
 
     with st.spinner("Cargando y normalizando hojas del template..."):
         data = load_data(excel_path)
+    
+    # Crear tabs: Template y OSDE
+    tab_template, tab_osde = st.tabs(["Template San Jose", "OSDE Comparativa"])
+    
+    # ===== TAB TEMPLATE =====
+    with tab_template:
+        template_main(data, excel_path)
+    
+    # ===== TAB OSDE =====
+    with tab_osde:
+        osde_main(data, excel_path)
 
+
+def template_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
+    """Contenido original de main() - pestaña Template"""
+    
     convenios_planes = data["convenios_planes"]
     homologaciones = data["homologaciones"]
     prestaciones_catalogos = data["prestaciones_catalogos"]
@@ -506,6 +568,142 @@ def main() -> None:
     with rd2:
         st.markdown("Prestaciones asociadas a la regla")
         st.dataframe(prest_regla, width="stretch", height=280)
+
+
+def osde_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
+    """Pestaña OSDE - Comparativa de IDs vs Template"""
+    
+    st.subheader("Comparativa OSDE vs Template")
+    st.caption("Compara códigos del archivo OSDE vs códigos del Template San Jose")
+    
+    # Cargar datos
+    with st.spinner("Cargando archivo OSDE..."):
+        osde_df = load_osde_csv()
+    
+    if osde_df.empty:
+        st.error("No se pudo cargar el archivo OSDE. Verifica que exista en docs/CONVENIO_BASE_OSDE/")
+        return
+    
+    # Extraer códigos del Template (Prestaciones del Catálogo)
+    pc = data["prestaciones_catalogos"].copy()
+    for col in ["Catalogo", "Codigo"]:
+        if col not in pc.columns:
+            pc[col] = ""
+        pc[col] = pc[col].map(norm)
+    
+    template_codigos = set(pc["Codigo"].unique())
+    template_codigos = {c for c in template_codigos if c}
+    
+    # Comparar
+    comparison = compare_osde_vs_template(osde_df, template_codigos)
+    
+    if "error" in comparison:
+        st.error(comparison["error"])
+        return
+    
+    osde_codigos = comparison["osde_codigos"]
+    template_codigos_norm = comparison["template_codigos"]
+    coincidencias = comparison["coincidencias"]
+    solo_osde = comparison["solo_osde"]
+    solo_template = comparison["solo_template"]
+    
+    # Métricas
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Códigos OSDE", len(osde_codigos))
+    m2.metric("Códigos Template", len(template_codigos_norm))
+    m3.metric("Coincidencias", len(coincidencias), delta=f"{len(coincidencias) / max(len(osde_codigos), 1) * 100:.1f}%")
+    m4.metric("Solo en OSDE", len(solo_osde))
+    m5.metric("Solo en Template", len(solo_template))
+    
+    st.markdown("---")
+    
+    # Crear DataFrame consolidado para visualización
+    all_codigos = sorted(osde_codigos | template_codigos_norm)
+    
+    comparativa_data = []
+    for codigo in all_codigos:
+        en_osde = "✓" if codigo in osde_codigos else ""
+        en_template = "✓" if codigo in template_codigos_norm else ""
+        estado = "Coincide" if (codigo in osde_codigos and codigo in template_codigos_norm) else ("Solo OSDE" if codigo in solo_osde else "Solo Template")
+        
+        comparativa_data.append({
+            "Codigo": codigo,
+            "En OSDE": en_osde,
+            "En Template": en_template,
+            "Estado": estado,
+        })
+    
+    comparativa_df = pd.DataFrame(comparativa_data)
+    
+    # Filtros
+    f1, f2 = st.columns([1.0, 2.0])
+    
+    estado_filter = f1.multiselect(
+        "Filtrar por estado",
+        options=["Coincide", "Solo OSDE", "Solo Template"],
+        default=["Coincide", "Solo OSDE", "Solo Template"]
+    )
+    
+    search_codigo = f2.text_input("Buscar código", value="")
+    
+    # Aplicar filtros
+    df_filtered = comparativa_df.copy()
+    
+    if estado_filter:
+        df_filtered = df_filtered[df_filtered["Estado"].isin(estado_filter)]
+    
+    if search_codigo:
+        search_norm = norm(search_codigo).upper()
+        df_filtered = df_filtered[df_filtered["Codigo"].str.upper().str.contains(search_norm, na=False)]
+    
+    # Mostrar tabla
+    st.subheader("Tabla de Doble Entrada - Coincidencias y Diferencias")
+    st.dataframe(
+        df_filtered,
+        width="stretch",
+        height=500,
+        column_config={
+            "Codigo": st.column_config.TextColumn("Código", width=150),
+            "En OSDE": st.column_config.TextColumn("En OSDE", width=100),
+            "En Template": st.column_config.TextColumn("En Template", width=100),
+            "Estado": st.column_config.TextColumn("Estado", width=150),
+        }
+    )
+    
+    # Descarga a Excel
+    st.markdown("---")
+    st.subheader("Descargar Resultados")
+    
+    # Crear archivo Excel con hojas
+    from io import BytesIO
+    import openpyxl
+    from openpyxl.styles import PatternFill, Font
+    
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # Hoja 1: Comparativa completa
+        df_filtered.to_excel(writer, index=False, sheet_name="Comparativa")
+        
+        # Hoja 2: Solo coincidencias
+        df_coincide = df_filtered[df_filtered["Estado"] == "Coincide"].copy()
+        df_coincide.to_excel(writer, index=False, sheet_name="Coincidencias")
+        
+        # Hoja 3: Solo en OSDE
+        df_osde_only = df_filtered[df_filtered["Estado"] == "Solo OSDE"].copy()
+        df_osde_only.to_excel(writer, index=False, sheet_name="Solo OSDE")
+        
+        # Hoja 4: Solo en Template
+        df_template_only = df_filtered[df_filtered["Estado"] == "Solo Template"].copy()
+        df_template_only.to_excel(writer, index=False, sheet_name="Solo Template")
+    
+    output.seek(0)
+    
+    st.download_button(
+        label="📥 Descargar Comparativa en Excel",
+        data=output.getvalue(),
+        file_name="OSDE_vs_Template_Comparativa.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 if __name__ == "__main__":
