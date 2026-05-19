@@ -384,6 +384,47 @@ def load_via_sano_catalog() -> tuple[pd.DataFrame, str]:
     return pd.DataFrame(rows), str(xlsx_path)
 
 
+@st.cache_data(show_spinner=False)
+def load_odi_catalog() -> tuple[pd.DataFrame, str]:
+    """Carga el catalogo ODI desde docs/CATALOGO_ODI/."""
+    odi_folder = _HERE / "docs" / "CATALOGO_ODI"
+    xlsx_files = sorted(odi_folder.rglob("*.xlsx"))
+
+    if not xlsx_files:
+        return pd.DataFrame(), ""
+
+    xlsx_path = xlsx_files[0]
+    wb = load_workbook(xlsx_path, data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    rows: list[dict[str, str]] = []
+    for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if row_idx == 1:
+            continue
+
+        codigo = norm(row[0] if len(row) > 0 else None)
+        descripcion = norm(row[1] if len(row) > 1 else None)
+        tipo = norm(row[2] if len(row) > 2 else None)
+
+        if not codigo or not descripcion:
+            continue
+
+        rows.append({"Codigo": codigo, "Descripcion": descripcion, "Tipo": tipo})
+
+    wb.close()
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out, str(xlsx_path)
+
+    out["Codigo"] = out["Codigo"].map(norm)
+    out["Descripcion"] = out["Descripcion"].map(norm)
+    out["Tipo"] = out["Tipo"].map(norm)
+    out["Codigo_norm"] = out["Codigo"].map(_normalize_code)
+    out = out.loc[out["Codigo_norm"] != ""].drop_duplicates(subset=["Codigo_norm"], keep="first").reset_index(drop=True)
+    return out, str(xlsx_path)
+
+
 def compare_code_name_vs_template(
     source_df: pd.DataFrame,
     template_df: pd.DataFrame,
@@ -474,6 +515,13 @@ def compare_osde_vs_template(osde_df: pd.DataFrame, template_df: pd.DataFrame) -
     return compare_code_name_vs_template(osde_df, template_df, "OSDE")
 
 
+def _safe_filename_part(value: str) -> str:
+    raw = norm(value).upper()
+    raw = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
+    raw = re.sub(r"[^A-Z0-9]+", "_", raw).strip("_")
+    return raw[:80] or "MODULO"
+
+
 def main() -> None:
     st.set_page_config(page_title="Baseline Convenios - San Jose", layout="wide")
 
@@ -491,8 +539,8 @@ def main() -> None:
     with st.spinner("Cargando y normalizando hojas del template..."):
         data = load_data(excel_path)
     
-    # Crear tabs: Template, OSDE y Via Sano
-    tab_template, tab_osde, tab_via_sano = st.tabs(["Template San Jose", "OSDE Comparativa", "Via Sano"])
+    # Crear tabs: Template, OSDE, Via Sano y Crear Modulo
+    tab_template, tab_osde, tab_via_sano, tab_crear_modulo = st.tabs(["Template San Jose", "OSDE Comparativa", "Via Sano", "CREAR MODULO"])
     
     # ===== TAB TEMPLATE =====
     with tab_template:
@@ -505,6 +553,10 @@ def main() -> None:
     # ===== TAB VIA SANO =====
     with tab_via_sano:
         via_sano_main(data, excel_path)
+
+    # ===== TAB CREAR MODULO =====
+    with tab_crear_modulo:
+        crear_modulo_main(data)
 
 
 def template_main(data: dict[str, pd.DataFrame], excel_path: Path, active_center: str) -> None:
@@ -1007,6 +1059,193 @@ def via_sano_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
         file_name="Via_Sano_vs_Template_Comparativa.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key="via_sano_download_button",
+    )
+
+
+def crear_modulo_main(data: dict[str, pd.DataFrame]) -> None:
+    """Solapa para crear/editar un modulo con prestaciones ODI y exportar cambios."""
+
+    st.subheader("Crear Modulo con Catalogo ODI")
+    st.caption("Selecciona un modulo y arma su composicion con prestaciones del catalogo ODI.")
+
+    odi_df, odi_path = load_odi_catalog()
+    if odi_df.empty:
+        st.error("No se pudo cargar el catalogo ODI. Verifica docs/CATALOGO_ODI/.")
+        return
+
+    if odi_path:
+        st.caption(f"Fuente ODI: {odi_path}")
+
+    pc = data["prestaciones_catalogos"].copy()
+    for col in ["Catalogo", "Codigo", "Nombre", "Es Modulo", "Modulo", "ESTADO"]:
+        if col not in pc.columns:
+            pc[col] = ""
+        pc[col] = pc[col].map(norm)
+    pc["Codigo_norm"] = pc["Codigo"].map(_normalize_code)
+
+    c1, c2, c3 = st.columns([1.2, 1.5, 1.0])
+    catalogo_opts = ["(Todos)"] + sorted([v for v in pc["Catalogo"].unique().tolist() if v])
+    catalogo_sel = c1.selectbox("Catalogo", options=catalogo_opts, index=0, key="crear_modulo_catalogo")
+
+    pc_scope = pc.copy()
+    if catalogo_sel != "(Todos)":
+        pc_scope = pc_scope.loc[pc_scope["Catalogo"].str.upper() == catalogo_sel.upper()].copy()
+
+    modulos = sorted(
+        [
+            m
+            for m in pc_scope.loc[
+                (pc_scope["Es Modulo"].str.upper() == "SI") & (pc_scope["Modulo"].map(norm) != ""),
+                "Modulo",
+            ]
+            .map(norm)
+            .unique()
+            .tolist()
+            if m
+        ]
+    )
+
+    if not modulos:
+        st.info("No hay modulos disponibles para el catalogo seleccionado.")
+        return
+
+    modulo_sel = c2.selectbox("Modulo", options=modulos, index=0, key="crear_modulo_modulo")
+    crear_click = c3.button("CREAR", key="crear_modulo_btn", use_container_width=True)
+
+    if crear_click:
+        st.session_state["crear_modulo_target"] = modulo_sel
+
+    target_modulo = st.session_state.get("crear_modulo_target", "")
+    if not target_modulo:
+        st.info("Selecciona modulo y presiona CREAR para abrir el editor.")
+        return
+
+    if target_modulo != modulo_sel:
+        st.info("Cambiaste el modulo. Presiona CREAR para cargar el nuevo modulo seleccionado.")
+        return
+
+    st.markdown("---")
+    st.markdown(f"### Editor de modulo: {modulo_sel}")
+
+    existing_assoc = pc_scope.loc[
+        (pc_scope["Es Modulo"].str.upper() == "SI")
+        & (pc_scope["Modulo"].str.upper() == modulo_sel.upper())
+        & (pc_scope["Codigo_norm"] != ""),
+        ["Catalogo", "Codigo", "Codigo_norm", "Nombre"],
+    ].drop_duplicates()
+
+    existing_all_codes = set(existing_assoc["Codigo_norm"].tolist())
+    odi_code_set = set(odi_df["Codigo_norm"].tolist())
+    existing_in_odi = existing_all_codes & odi_code_set
+    existing_outside_odi = existing_all_codes - odi_code_set
+
+    selected_key = f"crear_modulo_selected::{_safe_filename_part(modulo_sel)}"
+    if selected_key not in st.session_state:
+        st.session_state[selected_key] = sorted(existing_in_odi)
+
+    selected_codes = set(st.session_state[selected_key])
+
+    f1, f2, f3 = st.columns([1.0, 1.0, 1.8])
+    tipo_opts = sorted([v for v in odi_df["Tipo"].map(norm).unique().tolist() if v])
+    tipo_sel = f1.multiselect("Tipo ODI", options=tipo_opts, default=tipo_opts, key="crear_modulo_tipo")
+    search_sel = f2.text_input("Buscar codigo/descripción", value="", key="crear_modulo_search")
+
+    odi_work = odi_df.copy()
+    if tipo_sel:
+        odi_work = odi_work.loc[odi_work["Tipo"].isin(tipo_sel)].copy()
+
+    search_norm = norm(search_sel).upper()
+    if search_norm:
+        odi_work = odi_work.loc[
+            odi_work["Codigo"].map(norm).str.upper().str.contains(search_norm, na=False)
+            | odi_work["Descripcion"].map(norm).str.upper().str.contains(search_norm, na=False)
+        ].copy()
+
+    quick_labels = [f"{row.Codigo} - {row.Descripcion}" for row in odi_work.itertuples(index=False)]
+    quick_map = {f"{row.Codigo} - {row.Descripcion}": row.Codigo_norm for row in odi_work.itertuples(index=False)}
+    quick_pick = f3.multiselect(
+        "Multiselector prestaciones ODI (alta rapida)",
+        options=quick_labels,
+        default=[],
+        key="crear_modulo_quick_pick",
+    )
+    if quick_pick:
+        selected_codes.update([quick_map[v] for v in quick_pick if v in quick_map])
+
+    editor_df = odi_work[["Codigo", "Descripcion", "Tipo", "Codigo_norm"]].copy()
+    editor_df.insert(0, "Seleccionar", editor_df["Codigo_norm"].isin(selected_codes))
+
+    edited = st.data_editor(
+        editor_df,
+        width="stretch",
+        height=420,
+        hide_index=True,
+        key="crear_modulo_editor",
+        column_config={
+            "Seleccionar": st.column_config.CheckboxColumn("Seleccionar", help="Marcar para incluir en el modulo"),
+            "Codigo": st.column_config.TextColumn("Codigo", width=130),
+            "Descripcion": st.column_config.TextColumn("Prestacion ODI", width="large"),
+            "Tipo": st.column_config.TextColumn("Tipo", width=130),
+            "Codigo_norm": None,
+        },
+    )
+
+    selected_codes = set(edited.loc[edited["Seleccionar"], "Codigo_norm"].map(norm).tolist())
+    st.session_state[selected_key] = sorted([v for v in selected_codes if v])
+
+    final_df = odi_df.loc[odi_df["Codigo_norm"].isin(selected_codes), ["Codigo", "Descripcion", "Tipo", "Codigo_norm"]].copy()
+    final_df.insert(0, "Modulo", modulo_sel)
+
+    altas_codes = selected_codes - existing_in_odi
+    bajas_codes = existing_in_odi - selected_codes
+
+    altas_df = odi_df.loc[odi_df["Codigo_norm"].isin(altas_codes), ["Codigo", "Descripcion", "Tipo", "Codigo_norm"]].copy()
+    altas_df.insert(0, "Accion", "AGREGAR A MODULO")
+    altas_df.insert(1, "Modulo", modulo_sel)
+
+    bajas_df = odi_df.loc[odi_df["Codigo_norm"].isin(bajas_codes), ["Codigo", "Descripcion", "Tipo", "Codigo_norm"]].copy()
+    bajas_df.insert(0, "Accion", "VOLVER A NOMENCLADOR ODI")
+    bajas_df.insert(1, "Modulo", modulo_sel)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Asociadas actuales", len(existing_all_codes))
+    m2.metric("Seleccion final", len(selected_codes))
+    m3.metric("Altas", len(altas_codes))
+    m4.metric("Bajas", len(bajas_codes))
+
+    p1, p2 = st.columns(2)
+    with p1:
+        st.markdown("Prestaciones ODI seleccionadas para el modulo")
+        st.dataframe(final_df[["Modulo", "Codigo", "Descripcion", "Tipo"]], width="stretch", height=260)
+    with p2:
+        st.markdown("Prestaciones actuales fuera de CATALOGO_ODI")
+        if existing_outside_odi:
+            outside_df = existing_assoc.loc[existing_assoc["Codigo_norm"].isin(existing_outside_odi), ["Catalogo", "Codigo", "Nombre"]].copy()
+            st.dataframe(outside_df, width="stretch", height=260)
+        else:
+            st.info("No hay prestaciones fuera del catalogo ODI para este modulo.")
+
+    from io import BytesIO
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        final_df[["Modulo", "Codigo", "Descripcion", "Tipo"]].to_excel(writer, index=False, sheet_name="Modulo_Final")
+        altas_df[["Accion", "Modulo", "Codigo", "Descripcion", "Tipo"]].to_excel(writer, index=False, sheet_name="Altas")
+        bajas_df[["Accion", "Modulo", "Codigo", "Descripcion", "Tipo"]].to_excel(writer, index=False, sheet_name="Bajas")
+
+        if existing_outside_odi:
+            outside_df = existing_assoc.loc[existing_assoc["Codigo_norm"].isin(existing_outside_odi), ["Catalogo", "Codigo", "Nombre"]].copy()
+            outside_df.to_excel(writer, index=False, sheet_name="Fuera_Catalogo_ODI")
+
+    output.seek(0)
+    file_name = f"CATALOGO_ODI_{_safe_filename_part(modulo_sel)}.xlsx"
+
+    st.download_button(
+        label="Guardar cambios y descargar Excel",
+        data=output.getvalue(),
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="crear_modulo_download",
     )
 
 
