@@ -311,7 +311,12 @@ def _normalize_code(value: Any) -> str:
     text = text.replace(" ", "")
     # Estandariza diferencias de formato como 5°, 5º, 5ª, etc.
     text = re.sub(r"[^0-9A-Za-z]", "", text)
-    return text.upper()
+    text = text.upper()
+    # Codigos puramente numericos se normalizan a 6 digitos con cero adelante
+    # para equiparar ej. "17501" (Via Sano) con "017501" (Template)
+    if text.isdigit() and len(text) < 6:
+        text = text.zfill(6)
+    return text
 
 
 def _normalize_desc(value: Any) -> str:
