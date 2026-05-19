@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -276,51 +278,170 @@ def get_regla_prestaciones_drilldown(
     return rmd_view.reset_index(drop=True), prest_view.reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
 def load_osde_csv() -> pd.DataFrame:
     """Carga el CSV de OSDE desde docs/CONVENIO_BASE_OSDE/"""
     osde_folder = _HERE / "docs" / "CONVENIO_BASE_OSDE"
-    csv_files = list(osde_folder.glob("*.csv"))
+    csv_files = sorted(osde_folder.glob("*.csv"))
     
     if not csv_files:
         return pd.DataFrame()
     
-    # Tomar el primer CSV (en caso de haber múltiples)
+    # Toma el primer CSV en orden alfabético (si hubiera más de uno).
     csv_path = csv_files[0]
-    
-    try:
-        df = pd.read_csv(csv_path, sep=";", encoding="utf-8-sig")
-        return df
-    except Exception:
-        return pd.DataFrame()
+
+    encodings = ["utf-8-sig", "cp1252", "latin-1"]
+    seps = [";", ",", "\t"]
+
+    for enc in encodings:
+        for sep in seps:
+            try:
+                df = pd.read_csv(csv_path, sep=sep, encoding=enc, engine="python")
+                if not df.empty and len(df.columns) >= 2:
+                    return df
+            except Exception:
+                continue
+
+    return pd.DataFrame()
 
 
-def compare_osde_vs_template(osde_df: pd.DataFrame, template_codigos: set[str]) -> dict[str, Any]:
-    """Compara IDs del CSV OSDE vs códigos del Template"""
-    if osde_df.empty:
-        return {"error": "No se pudo cargar el archivo OSDE"}
-    
-    # Extraer códigos de OSDE (columna B = índice 1, o la segunda columna)
-    osde_codigos = set()
-    if len(osde_df.columns) > 1:
-        col_b = osde_df.columns[1]  # Segunda columna (índice 1)
-        osde_codigos = {norm(str(v)) for v in osde_df[col_b].unique() if norm(str(v))}
-    
-    template_codigos_norm = {norm(c) for c in template_codigos if c}
-    
-    # Comparativa
-    coincidencias = osde_codigos & template_codigos_norm
-    solo_osde = osde_codigos - template_codigos_norm
-    solo_template = template_codigos_norm - osde_codigos
-    
+def _normalize_code(value: Any) -> str:
+    text = norm(value)
+    if not text:
+        return ""
+    text = text.replace(" ", "")
+    # Estandariza diferencias de formato como 5°, 5º, 5ª, etc.
+    text = re.sub(r"[^0-9A-Za-z]", "", text)
+    return text.upper()
+
+
+def _normalize_desc(value: Any) -> str:
+    text = norm(value).upper()
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+@st.cache_data(show_spinner=False)
+def load_via_sano_catalog() -> tuple[pd.DataFrame, str]:
+    """Carga el catalogo de Via Sano desde docs/Catalogo_via_sano/."""
+    via_sano_folder = _HERE / "docs" / "Catalogo_via_sano"
+    xlsx_files = sorted(via_sano_folder.rglob("*.xlsx"))
+
+    if not xlsx_files:
+        return pd.DataFrame(), ""
+
+    xlsx_path = xlsx_files[0]
+    wb = load_workbook(xlsx_path, data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+
+    rows: list[dict[str, str]] = []
+    for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+        if row_idx <= 6:
+            continue
+
+        codigo = norm(row[1] if len(row) > 1 else None)
+        descripcion = norm(row[2] if len(row) > 2 else None)
+
+        if not codigo or not descripcion:
+            continue
+
+        if codigo.upper() in {"CODIGO", "CÓDIGO"}:
+            continue
+
+        rows.append({"Codigo": codigo, "Descripcion": descripcion})
+
+    wb.close()
+    return pd.DataFrame(rows), str(xlsx_path)
+
+
+def compare_code_name_vs_template(
+    source_df: pd.DataFrame,
+    template_df: pd.DataFrame,
+    source_label: str,
+    template_catalog_name: str | None = None,
+) -> dict[str, Any]:
+    """Compara codigo + descripcion del origen contra codigo + nombre del Template."""
+    if source_df.empty:
+        return {"error": f"No se pudo cargar el archivo {source_label}"}
+
+    if "Codigo" not in source_df.columns or "Descripcion" not in source_df.columns:
+        return {"error": f"El archivo {source_label} no tiene las columnas esperadas de codigo y descripcion."}
+
+    source_work = source_df[["Codigo", "Descripcion"]].copy()
+    source_work["Codigo"] = source_work["Codigo"].map(norm)
+    source_work["Descripcion"] = source_work["Descripcion"].map(norm)
+    source_work["Codigo_norm"] = source_work["Codigo"].map(_normalize_code)
+    source_work["Desc_norm"] = source_work["Descripcion"].map(_normalize_desc)
+    source_work = source_work.loc[source_work["Codigo_norm"] != ""].drop_duplicates()
+
+    tpl = template_df.copy()
+    for col in ["Codigo", "Nombre", "Catalogo"]:
+        if col not in tpl.columns:
+            tpl[col] = ""
+
+    if template_catalog_name is not None:
+        tpl = tpl.loc[tpl["Catalogo"].map(norm).str.upper() == template_catalog_name.upper()].copy()
+
+    tpl = tpl[["Codigo", "Nombre"]].copy()
+    tpl.rename(columns={"Nombre": "Nombre_Template"}, inplace=True)
+    tpl["Codigo"] = tpl["Codigo"].map(norm)
+    tpl["Nombre_Template"] = tpl["Nombre_Template"].map(norm)
+    tpl["Codigo_norm"] = tpl["Codigo"].map(_normalize_code)
+    tpl["Desc_norm"] = tpl["Nombre_Template"].map(_normalize_desc)
+    tpl = tpl.loc[tpl["Codigo_norm"] != ""].drop_duplicates()
+
+    source_pairs = set(zip(source_work["Codigo_norm"], source_work["Desc_norm"]))
+    tpl_pairs = set(zip(tpl["Codigo_norm"], tpl["Desc_norm"]))
+    pair_matches = source_pairs & tpl_pairs
+
+    source_by_code = source_work.groupby("Codigo_norm")["Descripcion"].apply(lambda s: " | ".join(sorted({norm(v) for v in s if norm(v)}))).to_dict()
+    tpl_by_code = tpl.groupby("Codigo_norm")["Nombre_Template"].apply(lambda s: " | ".join(sorted({norm(v) for v in s if norm(v)}))).to_dict()
+
+    source_codes = set(source_by_code.keys())
+    tpl_codes = set(tpl_by_code.keys())
+    all_codes = sorted(source_codes | tpl_codes)
+
+    rows: list[dict[str, str]] = []
+    for code in all_codes:
+        in_source = code in source_codes
+        in_tpl = code in tpl_codes
+
+        if in_source and in_tpl:
+            source_descs = {_normalize_desc(v) for v in source_by_code[code].split(" | ") if norm(v)}
+            tpl_descs = {_normalize_desc(v) for v in tpl_by_code[code].split(" | ") if norm(v)}
+            if source_descs & tpl_descs:
+                estado = "Coincide Codigo+Nombre"
+            else:
+                estado = "Codigo coincide, Nombre difiere"
+        elif in_source:
+            estado = f"Solo {source_label}"
+        else:
+            estado = "Solo Template"
+
+        rows.append(
+            {
+                "Codigo": code,
+                f"Descripcion {source_label}": source_by_code.get(code, ""),
+                "Nombre Template": tpl_by_code.get(code, ""),
+                f"En {source_label}": "SI" if in_source else "NO",
+                "En Template": "SI" if in_tpl else "NO",
+                "Estado": estado,
+            }
+        )
+
+    comparativa_df = pd.DataFrame(rows)
+
     return {
-        "osde_codigos": osde_codigos,
-        "template_codigos": template_codigos_norm,
-        "coincidencias": coincidencias,
-        "solo_osde": solo_osde,
-        "solo_template": solo_template,
-        "osde_df": osde_df,
+        "comparativa_df": comparativa_df,
+        "coincide_completo": len(pair_matches),
+        "codigos_source": len(source_codes),
+        "codigos_template": len(tpl_codes),
     }
+
+
+def compare_osde_vs_template(osde_df: pd.DataFrame, template_df: pd.DataFrame) -> dict[str, Any]:
+    """Compara Código+Descripción (OSDE) vs Código+Nombre (Template)."""
+    return compare_code_name_vs_template(osde_df, template_df, "OSDE")
 
 
 def main() -> None:
@@ -337,8 +458,8 @@ def main() -> None:
     with st.spinner("Cargando y normalizando hojas del template..."):
         data = load_data(excel_path)
     
-    # Crear tabs: Template y OSDE
-    tab_template, tab_osde = st.tabs(["Template San Jose", "OSDE Comparativa"])
+    # Crear tabs: Template, OSDE y Via Sano
+    tab_template, tab_osde, tab_via_sano = st.tabs(["Template San Jose", "OSDE Comparativa", "Via Sano"])
     
     # ===== TAB TEMPLATE =====
     with tab_template:
@@ -347,6 +468,10 @@ def main() -> None:
     # ===== TAB OSDE =====
     with tab_osde:
         osde_main(data, excel_path)
+
+    # ===== TAB VIA SANO =====
+    with tab_via_sano:
+        via_sano_main(data, excel_path)
 
 
 def template_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
@@ -571,80 +696,83 @@ def template_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
 
 
 def osde_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
-    """Pestaña OSDE - Comparativa de IDs vs Template"""
+    """Pestaña OSDE - Comparativa Código+Nombre vs OSDE."""
     
     st.subheader("Comparativa OSDE vs Template")
-    st.caption("Compara códigos del archivo OSDE vs códigos del Template San Jose")
+    st.caption("Compara Codigo+Nombre (Template) vs Codigo (columna B) + Descripcion (columna C) de OSDE")
     
     # Cargar datos
     with st.spinner("Cargando archivo OSDE..."):
-        osde_df = load_osde_csv()
+        osde_raw = load_osde_csv()
     
-    if osde_df.empty:
+    if osde_raw.empty:
         st.error("No se pudo cargar el archivo OSDE. Verifica que exista en docs/CONVENIO_BASE_OSDE/")
         return
+
+    if len(osde_raw.columns) < 3:
+        st.error("El archivo OSDE no tiene suficientes columnas (se esperan B y C).")
+        return
+
+    osde_df = pd.DataFrame(
+        {
+            "Codigo": osde_raw.iloc[:, 1].map(norm),
+            "Descripcion": osde_raw.iloc[:, 2].map(norm),
+        }
+    )
     
-    # Extraer códigos del Template (Prestaciones del Catálogo)
+    # Extraer prestaciones del Template (hoja PrestacionesCatalogos)
     pc = data["prestaciones_catalogos"].copy()
-    for col in ["Catalogo", "Codigo"]:
+    for col in ["Catalogo", "Codigo", "Nombre"]:
         if col not in pc.columns:
             pc[col] = ""
         pc[col] = pc[col].map(norm)
-    
-    template_codigos = set(pc["Codigo"].unique())
-    template_codigos = {c for c in template_codigos if c}
-    
+
     # Comparar
-    comparison = compare_osde_vs_template(osde_df, template_codigos)
+    comparison = compare_osde_vs_template(osde_df, pc)
     
     if "error" in comparison:
         st.error(comparison["error"])
         return
     
-    osde_codigos = comparison["osde_codigos"]
-    template_codigos_norm = comparison["template_codigos"]
-    coincidencias = comparison["coincidencias"]
-    solo_osde = comparison["solo_osde"]
-    solo_template = comparison["solo_template"]
+    comparativa_df = comparison["comparativa_df"]
+    codigos_osde = int(comparison["codigos_source"])
+    codigos_template = int(comparison["codigos_template"])
+    coincide_completo = int(comparison["coincide_completo"])
+    solo_osde = int((comparativa_df["Estado"] == "Solo OSDE").sum())
+    solo_template = int((comparativa_df["Estado"] == "Solo Template").sum())
+    codigo_difiere = int((comparativa_df["Estado"] == "Codigo coincide, Nombre difiere").sum())
     
     # Métricas
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Códigos OSDE", len(osde_codigos))
-    m2.metric("Códigos Template", len(template_codigos_norm))
-    m3.metric("Coincidencias", len(coincidencias), delta=f"{len(coincidencias) / max(len(osde_codigos), 1) * 100:.1f}%")
-    m4.metric("Solo en OSDE", len(solo_osde))
-    m5.metric("Solo en Template", len(solo_template))
+    m1.metric("Codigos OSDE", codigos_osde)
+    m2.metric("Codigos Template", codigos_template)
+    m3.metric("Coincide Codigo+Nombre", coincide_completo)
+    m4.metric("Codigo coincide / nombre difiere", codigo_difiere)
+    m5.metric("Solo OSDE / Solo Template", f"{solo_osde} / {solo_template}")
     
     st.markdown("---")
     
-    # Crear DataFrame consolidado para visualización
-    all_codigos = sorted(osde_codigos | template_codigos_norm)
-    
-    comparativa_data = []
-    for codigo in all_codigos:
-        en_osde = "✓" if codigo in osde_codigos else ""
-        en_template = "✓" if codigo in template_codigos_norm else ""
-        estado = "Coincide" if (codigo in osde_codigos and codigo in template_codigos_norm) else ("Solo OSDE" if codigo in solo_osde else "Solo Template")
-        
-        comparativa_data.append({
-            "Codigo": codigo,
-            "En OSDE": en_osde,
-            "En Template": en_template,
-            "Estado": estado,
-        })
-    
-    comparativa_df = pd.DataFrame(comparativa_data)
-    
     # Filtros
-    f1, f2 = st.columns([1.0, 2.0])
+    f1, f2 = st.columns([1.1, 1.9])
     
     estado_filter = f1.multiselect(
         "Filtrar por estado",
-        options=["Coincide", "Solo OSDE", "Solo Template"],
-        default=["Coincide", "Solo OSDE", "Solo Template"]
+        options=[
+            "Coincide Codigo+Nombre",
+            "Codigo coincide, Nombre difiere",
+            "Solo OSDE",
+            "Solo Template",
+        ],
+        default=[
+            "Coincide Codigo+Nombre",
+            "Codigo coincide, Nombre difiere",
+            "Solo OSDE",
+            "Solo Template",
+        ],
+        key="osde_estado_filter",
     )
     
-    search_codigo = f2.text_input("Buscar código", value="")
+    search_codigo = f2.text_input("Buscar codigo o descripcion", value="", key="osde_search_codigo")
     
     # Aplicar filtros
     df_filtered = comparativa_df.copy()
@@ -654,19 +782,26 @@ def osde_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
     
     if search_codigo:
         search_norm = norm(search_codigo).upper()
-        df_filtered = df_filtered[df_filtered["Codigo"].str.upper().str.contains(search_norm, na=False)]
+        mask_search = (
+            df_filtered["Codigo"].map(norm).str.upper().str.contains(search_norm, na=False)
+            | df_filtered["Descripcion OSDE"].map(norm).str.upper().str.contains(search_norm, na=False)
+            | df_filtered["Nombre Template"].map(norm).str.upper().str.contains(search_norm, na=False)
+        )
+        df_filtered = df_filtered.loc[mask_search]
     
     # Mostrar tabla
-    st.subheader("Tabla de Doble Entrada - Coincidencias y Diferencias")
+    st.subheader("Tabla de Doble Entrada - Codigo y Nombre")
     st.dataframe(
         df_filtered,
         width="stretch",
         height=500,
         column_config={
-            "Codigo": st.column_config.TextColumn("Código", width=150),
-            "En OSDE": st.column_config.TextColumn("En OSDE", width=100),
-            "En Template": st.column_config.TextColumn("En Template", width=100),
-            "Estado": st.column_config.TextColumn("Estado", width=150),
+            "Codigo": st.column_config.TextColumn("Codigo", width=140),
+            "Descripcion OSDE": st.column_config.TextColumn("Descripcion OSDE", width="large"),
+            "Nombre Template": st.column_config.TextColumn("Nombre Template", width="large"),
+            "En OSDE": st.column_config.TextColumn("En OSDE", width=95),
+            "En Template": st.column_config.TextColumn("En Template", width=110),
+            "Estado": st.column_config.TextColumn("Estado", width=230),
         }
     )
     
@@ -676,33 +811,169 @@ def osde_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
     
     # Crear archivo Excel con hojas
     from io import BytesIO
-    import openpyxl
-    from openpyxl.styles import PatternFill, Font
-    
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Hoja 1: Comparativa completa
         df_filtered.to_excel(writer, index=False, sheet_name="Comparativa")
         
         # Hoja 2: Solo coincidencias
-        df_coincide = df_filtered[df_filtered["Estado"] == "Coincide"].copy()
+        df_coincide = df_filtered[df_filtered["Estado"] == "Coincide Codigo+Nombre"].copy()
         df_coincide.to_excel(writer, index=False, sheet_name="Coincidencias")
+
+        # Hoja 3: Codigo coincide / nombre difiere
+        df_nombre_difiere = df_filtered[df_filtered["Estado"] == "Codigo coincide, Nombre difiere"].copy()
+        df_nombre_difiere.to_excel(writer, index=False, sheet_name="Nombre Difiere")
         
-        # Hoja 3: Solo en OSDE
+        # Hoja 4: Solo en OSDE
         df_osde_only = df_filtered[df_filtered["Estado"] == "Solo OSDE"].copy()
         df_osde_only.to_excel(writer, index=False, sheet_name="Solo OSDE")
         
-        # Hoja 4: Solo en Template
+        # Hoja 5: Solo en Template
         df_template_only = df_filtered[df_filtered["Estado"] == "Solo Template"].copy()
         df_template_only.to_excel(writer, index=False, sheet_name="Solo Template")
     
     output.seek(0)
     
     st.download_button(
-        label="📥 Descargar Comparativa en Excel",
+        label="Descargar Comparativa en Excel",
         data=output.getvalue(),
         file_name="OSDE_vs_Template_Comparativa.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="osde_download_button",
+    )
+
+
+def via_sano_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
+    """Pestaña Via Sano - Comparativa del catalogo de Via Sano contra el Template."""
+
+    st.subheader("Comparativa Via Sano vs Template")
+    st.caption("Compara el catalogo de Via Sano contra el dato maestro del Template para el catalogo VIA SANO.")
+
+    with st.spinner("Cargando archivo Via Sano..."):
+        via_sano_df, via_sano_path = load_via_sano_catalog()
+
+    if via_sano_df.empty:
+        st.error("No se pudo cargar el archivo Via Sano. Verifica que exista en docs/Catalogo_via_sano/")
+        return
+
+    if via_sano_path:
+        st.caption(f"Archivo fuente: {via_sano_path}")
+
+    pc = data["prestaciones_catalogos"].copy()
+    for col in ["Catalogo", "Codigo", "Nombre"]:
+        if col not in pc.columns:
+            pc[col] = ""
+        pc[col] = pc[col].map(norm)
+
+    comparison = compare_code_name_vs_template(via_sano_df, pc, "Via Sano", template_catalog_name="VIA SANO")
+
+    if "error" in comparison:
+        st.error(comparison["error"])
+        return
+
+    comparativa_df = comparison["comparativa_df"]
+    codigos_via_sano = int(comparison["codigos_source"])
+    codigos_template = int(comparison["codigos_template"])
+    coincide_completo = int(comparison["coincide_completo"])
+    solo_via_sano = int((comparativa_df["Estado"] == "Solo Via Sano").sum())
+    solo_template = int((comparativa_df["Estado"] == "Solo Template").sum())
+    codigo_difiere = int((comparativa_df["Estado"] == "Codigo coincide, Nombre difiere").sum())
+    gap_total = solo_via_sano + solo_template + codigo_difiere
+    cobertura_template = (coincide_completo / codigos_template * 100.0) if codigos_template else 0.0
+
+    estado_display = {
+        "Coincide Codigo+Nombre": "Coinciden",
+        "Codigo coincide, Nombre difiere": "Nombre distinto",
+        "Solo Via Sano": "Nuevos en Via Sano",
+        "Solo Template": "Faltan en Via Sano",
+    }
+
+    st.caption(f"Totales base: Via Sano={codigos_via_sano} | Template={codigos_template}")
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Coinciden", coincide_completo)
+    m2.metric("Nombre distinto", codigo_difiere)
+    m3.metric("Nuevos en Via Sano", solo_via_sano)
+    m4.metric("Faltan en Via Sano", solo_template)
+    m5.metric("GAP total", gap_total)
+    m6.metric("Cobertura vs Template", f"{cobertura_template:.1f}%")
+
+    st.markdown("---")
+
+    f1, f2 = st.columns([1.1, 1.9])
+
+    estado_options = list(estado_display.values())
+    estado_filter = f1.multiselect(
+        "Filtrar por tipo de brecha",
+        options=estado_options,
+        default=estado_options,
+        key="via_sano_estado_filter",
+    )
+
+    search_codigo = f2.text_input("Buscar codigo o descripcion", value="", key="via_sano_search_codigo")
+
+    df_filtered = comparativa_df.copy()
+
+    if estado_filter:
+        estados_selected = [k for k, v in estado_display.items() if v in estado_filter]
+        df_filtered = df_filtered[df_filtered["Estado"].isin(estados_selected)]
+
+    if search_codigo:
+        search_norm = norm(search_codigo).upper()
+        mask_search = (
+            df_filtered["Codigo"].map(norm).str.upper().str.contains(search_norm, na=False)
+            | df_filtered["Descripcion Via Sano"].map(norm).str.upper().str.contains(search_norm, na=False)
+            | df_filtered["Nombre Template"].map(norm).str.upper().str.contains(search_norm, na=False)
+        )
+        df_filtered = df_filtered.loc[mask_search]
+
+    df_filtered = df_filtered.copy()
+    df_filtered["Tipo GAP"] = df_filtered["Estado"].map(estado_display).fillna(df_filtered["Estado"])
+
+    st.subheader("Tabla de Doble Entrada - Via Sano")
+    st.dataframe(
+        df_filtered[["Codigo", "Descripcion Via Sano", "Nombre Template", "En Via Sano", "En Template", "Tipo GAP"]],
+        width="stretch",
+        height=500,
+        column_config={
+            "Codigo": st.column_config.TextColumn("Codigo", width=140),
+            "Descripcion Via Sano": st.column_config.TextColumn("Descripcion Via Sano", width="large"),
+            "Nombre Template": st.column_config.TextColumn("Nombre Template", width="large"),
+            "En Via Sano": st.column_config.TextColumn("En Via Sano", width=95),
+            "En Template": st.column_config.TextColumn("En Template", width=110),
+            "Tipo GAP": st.column_config.TextColumn("Tipo GAP", width=230),
+        },
+    )
+
+    st.markdown("---")
+    st.subheader("Descargar Resultados")
+
+    from io import BytesIO
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_filtered.to_excel(writer, index=False, sheet_name="Comparativa")
+
+        df_coincide = df_filtered[df_filtered["Estado"] == "Coincide Codigo+Nombre"].copy()
+        df_coincide.to_excel(writer, index=False, sheet_name="Coincidencias")
+
+        df_nombre_difiere = df_filtered[df_filtered["Estado"] == "Codigo coincide, Nombre difiere"].copy()
+        df_nombre_difiere.to_excel(writer, index=False, sheet_name="Nombre Difiere")
+
+        df_via_sano_only = df_filtered[df_filtered["Estado"] == "Solo Via Sano"].copy()
+        df_via_sano_only.to_excel(writer, index=False, sheet_name="Solo Via Sano")
+
+        df_template_only = df_filtered[df_filtered["Estado"] == "Solo Template"].copy()
+        df_template_only.to_excel(writer, index=False, sheet_name="Solo Template")
+
+    output.seek(0)
+
+    st.download_button(
+        label="Descargar Comparativa en Excel",
+        data=output.getvalue(),
+        file_name="Via_Sano_vs_Template_Comparativa.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="via_sano_download_button",
     )
 
 
