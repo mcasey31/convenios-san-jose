@@ -12,7 +12,32 @@ from openpyxl import load_workbook
 BASELINE_CENTER = "San Jose"
 # Ruta relativa a la raiz del repo; funciona en local y en Streamlit Cloud
 _HERE = Path(__file__).parent
-DEFAULT_EXCEL = str(_HERE / "docs" / "Template V4b - San José (6).xlsx")
+
+
+def _resolve_default_excel() -> Path:
+    preferred_candidates = [
+        _HERE / "docs" / "Template V4b - San José (7)" / "Template V4b - San José (7).xlsx",
+        _HERE / "Template V4b - San José (7)" / "Template V4b - San José (7).xlsx",
+        _HERE / "docs" / "Template V4b - San José (7).xlsx",
+        _HERE / "docs" / "Template V4b - San José (6).xlsx",
+    ]
+    for candidate in preferred_candidates:
+        if candidate.exists():
+            return candidate
+
+    # Fallback defensivo si el nombre del template cambia levemente.
+    fallback_roots = [_HERE / "docs", _HERE]
+    for root in fallback_roots:
+        if not root.exists():
+            continue
+        matches = sorted([p for p in root.rglob("*.xlsx") if "TEMPLATE" in p.name.upper() and "SAN JOS" in p.name.upper()])
+        if matches:
+            return matches[-1]
+
+    return preferred_candidates[0]
+
+
+DEFAULT_EXCEL = str(_resolve_default_excel())
 
 
 def norm(value: Any) -> str:
@@ -455,6 +480,9 @@ def main() -> None:
     st.title("Baseline de Configuracion de Convenios")
     st.caption(f"Centro baseline: {BASELINE_CENTER}")
 
+    center_options = [BASELINE_CENTER, "(Todos)"]
+    active_center = st.selectbox("Centro activo", options=center_options, index=0, key="active_center")
+
     excel_path = Path(st.text_input("Ruta Excel", value=DEFAULT_EXCEL)).expanduser()
     if not excel_path.exists():
         st.error("No se encontro el archivo Excel en la ruta indicada.")
@@ -468,7 +496,7 @@ def main() -> None:
     
     # ===== TAB TEMPLATE =====
     with tab_template:
-        template_main(data, excel_path)
+        template_main(data, excel_path, active_center)
     
     # ===== TAB OSDE =====
     with tab_osde:
@@ -479,7 +507,7 @@ def main() -> None:
         via_sano_main(data, excel_path)
 
 
-def template_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
+def template_main(data: dict[str, pd.DataFrame], excel_path: Path, active_center: str) -> None:
     """Contenido original de main() - pestaña Template"""
     
     convenios_planes = data["convenios_planes"]
@@ -547,7 +575,7 @@ def template_main(data: dict[str, pd.DataFrame], excel_path: Path) -> None:
 
     # Context cards
     cards = st.columns(4)
-    cards[0].metric("Centro", BASELINE_CENTER)
+    cards[0].metric("Centro", norm(active_center) or BASELINE_CENTER)
     cards[1].metric("Catalogo", norm(catalogo_sel) or "-")
     cards[2].metric("Convenio", norm(convenio_sel) or "(Todos)")
     cards[3].metric("Financiador / Plan", f"{norm(fin_sel) or '(Todos)'} / {norm(plan_sel) or '(Todos)'}")
